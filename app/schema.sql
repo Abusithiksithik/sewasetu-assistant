@@ -109,3 +109,20 @@ CREATE TABLE IF NOT EXISTS oauth_program_tokens (     -- admin-issued, long-live
     expires_at TIMESTAMP,
     revoked_at TIMESTAMP
 );
+
+-- Assistant channel (fellowship, Oct 2026). Also created at app start-up for databases
+-- initialised before these existed.
+CREATE TABLE IF NOT EXISTS drafts (            -- an application being filled in through an assistant
+    mobile     VARCHAR(15) PRIMARY KEY,
+    data       JSONB,
+    doc_path   VARCHAR(200),
+    doc_name   VARCHAR(100),
+    updated_at TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS upload_links (      -- one-time links to upload an age proof from a phone
+    token_hash VARCHAR(64) PRIMARY KEY,
+    mobile     VARCHAR(15),
+    created_at TIMESTAMP,
+    expires_at TIMESTAMP,
+    used_at    TIMESTAMP
+);
