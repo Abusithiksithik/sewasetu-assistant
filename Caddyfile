@@ -1,0 +1,26 @@
+# One public origin for the portal and both MCP servers, with automatic HTTPS.
+# DOMAIN comes from .env (e.g. sewasetu.example.in). For a bare IP use DOMAIN=:80 (no TLS).
+{$DOMAIN} {
+	encode gzip
+
+	# The internal API that sits behind the MCP servers is never public.
+	handle /internal/* {
+		respond 404
+	}
+
+	handle /mcp/* {
+		reverse_proxy assistant:8100 {
+			flush_interval -1
+		}
+	}
+	handle /.well-known/oauth-protected-resource* {
+		reverse_proxy assistant:8100
+	}
+	handle /eval-dashboard* {
+		reverse_proxy assistant:8100
+	}
+
+	handle {
+		reverse_proxy app:8000
+	}
+}

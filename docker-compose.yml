@@ -1,3 +1,5 @@
+# Sewa Setu + assistant. Copy .env.example to .env, fill it in, then:
+#   docker compose up -d --build
 services:
   db:
     image: postgres:15
@@ -5,46 +7,95 @@ services:
       POSTGRES_DB: sewasetu
       POSTGRES_USER: sewasetu
       POSTGRES_PASSWORD: sewasetu123
+      TZ: Asia/Kolkata
+      PGTZ: Asia/Kolkata
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./app/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
       - ./seed/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql
+    restart: unless-stopped
 
   app:
     build: ./app
-    ports:
-      - "8000:8000"
+    # not published on the host: Caddy is the only way in
+    expose:
+      - "8000"
     environment:
       ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
-      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-change-me-before-deploying}
-      # the address at which people reach this portal; stamped into sign-in tokens and
-      # discovery documents, so it must be the public one when deployed
-      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8000}
+      # no default: an unset or shipped-default password disables officer login
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD in .env}
+      SECRET_KEY: ${SECRET_KEY:?set SECRET_KEY in .env}
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY:?set INTERNAL_API_KEY in .env}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:?set PUBLIC_BASE_URL in .env}
+      # the portal's clock is IST; timestamps written with datetime.now() must be too
+      TZ: Asia/Kolkata
     depends_on:
       - db
       - smsgw
     volumes:
       - uploads:/var/sewasetu/uploads
       - applogs:/var/log/sewasetu
+    restart: unless-stopped
 
   scheduler:
     build: ./app
-    # Run the deemed-approval job once at startup (so a freshly restored
-    # database is brought up to date), then hand over to cron for the nightly run.
+    # Run the deemed-approval job once at startup, then cron nightly. The job now
+    # escalates (instead of approving) applicants who were under 60 when they applied.
+    # To see what a first boot would do, run: docker compose run --rm -e DRY_RUN=1 scheduler python /app/scripts/deemed_approval.py
     command: ["sh", "-c", "until python /app/scripts/deemed_approval.py; do sleep 5; done; exec cron -f"]
+    environment:
+      TZ: Asia/Kolkata
     depends_on:
       - db
     volumes:
       - applogs:/var/log/sewasetu
+    restart: unless-stopped
 
   smsgw:
     build: ./smsgw
-    # internal only — reached by the app over the docker network and exposed to
-    # users via the app at /__gateway/ (so no second host port is needed)
     expose:
       - "8025"
+    restart: unless-stopped
+
+  assistant:
+    build: ./assistant
+    expose:
+      - "8100"
+    environment:
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL}
+      PORTAL_INTERNAL_URL: http://app:8000
+      SMS_GATEWAY_URL: http://smsgw:8025
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ASSISTANT_MODEL: ${ASSISTANT_MODEL:-claude-haiku-5-5}
+      SIMULATOR_MODEL: ${SIMULATOR_MODEL:-claude-sonnet-5-5}
+      TZ: Asia/Kolkata
+    volumes:
+      - evalresults:/srv/evals/results
+    depends_on:
+      - app
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddydata:/data
+    depends_on:
+      - app
+      - assistant
+    restart: unless-stopped
 
 volumes:
   pgdata:
   uploads:
   applogs:
+  evalresults:
+  caddydata:
