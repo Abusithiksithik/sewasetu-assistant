@@ -41,12 +41,16 @@ app.config["PERMANENT_SESSION_LIFETIME"] = 7200
 
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+# The compose file used to ship a working default. A default password on a public
+# deployment is no password at all: treat it as unset (officer login disabled).
+if ADMIN_PASSWORD in ("change-me-before-deploying", "pick-something"):
+    ADMIN_PASSWORD = ""
 
 # An applicant may hold at most one application in these states at a time.
 # WITHDRAWN and REJECTED applications do not block a fresh application.
 ACTIVE_STATUSES = ("PENDING", "APPROVED", "DEEMED_APPROVED")
 
-SMS_GATEWAY_URL = config.get("app", "sms_gateway_url")
+SMS_GATEWAY_URL = os.environ.get("SMS_GATEWAY_URL") or config.get("app", "sms_gateway_url")
 OTP_VALIDITY_SECONDS = config.getint("app", "otp_validity_seconds")
 UPLOAD_DIR = config.get("app", "upload_dir")
 SCHEME_DEADLINE = datetime.strptime(config.get("pension", "scheme_deadline"),
@@ -70,7 +74,7 @@ except Exception:
 
 def get_db():
     return psycopg2.connect(
-        host=config.get("database", "host"),
+        host=os.environ.get("DB_HOST") or config.get("database", "host"),
         port=config.get("database", "port"),
         dbname=config.get("database", "name"),
         user=config.get("database", "user"),
@@ -142,11 +146,11 @@ def validate_application(data, doc_path):
     errors = []
     cleaned = {
         "applicant_name": sanitize(data.get("applicant_name")),
-        "village": (data.get("village") or "").strip(),
+        "village": sanitize(data.get("village")),
         "block": (data.get("block") or "").strip(),
-        "gender": data.get("gender") or "",
-        "marital_status": data.get("marital_status") or "",
-        "husband_name": (data.get("husband_name") or "").strip(),
+        "gender": sanitize(data.get("gender"), 10),
+        "marital_status": sanitize(data.get("marital_status"), 20),
+        "husband_name": sanitize(data.get("husband_name")),
         "husband_employer": "",  # no longer collected (not a scheme requirement)
         "bank_account": re.sub(r"[\s-]", "", data.get("bank_account") or ""),
         "ifsc": re.sub(r"[\s-]", "", (data.get("ifsc") or "")).upper(),
@@ -161,7 +165,15 @@ def validate_application(data, doc_path):
         errors.append("block must be one of: " + ", ".join(BLOCKS))
     if cleaned["bank_account"] and not re.fullmatch(r"\d{9,18}", cleaned["bank_account"]):
         errors.append("bank account number must be 9 to 18 digits")
-    if cleaned["ifsc"] and not re.fullmatch(r"[A-Z]{4}0[A-Z0-9]{6}", cleaned["ifsc"]):
+    if not cleaned["ifsc"]:
+        # DBT cannot credit an account without its branch code.
+        errors.append("IFSC is required (it is printed in the bank passbook)")
+    elif cleaned["ifsc"].startswith("UTBI"):
+        errors.append("IFSC %s belongs to United Bank of India, which merged into Punjab "
+                      "National Bank in 2020; old UTBI codes no longer work. Please ask the "
+                      "bank branch or check the passbook/SMS for the new PUNB IFSC"
+                      % cleaned["ifsc"])
+    elif not re.fullmatch(r"[A-Z]{4}0[A-Z0-9]{6}", cleaned["ifsc"]):
         errors.append("IFSC must be 11 characters, e.g. SBIN0003077")
     dob = parse_dob(data.get("dob"))
     if dob is None:
@@ -177,6 +189,12 @@ def validate_application(data, doc_path):
     return errors, cleaned
 
 
+def lock_mobile(cur, mobile):
+    """Hold a transaction-scoped lock on this mobile so two submissions cannot both
+    pass the one-active-application check (agents retry; people double-tap)."""
+    cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", ("sewasetu-apply:" + mobile,))
+
+
 def active_application(cur, mobile):
     """The applicant's current live application, if any."""
     cur.execute("SELECT id, application_no, status FROM applications "
@@ -185,7 +203,7 @@ def active_application(cur, mobile):
     return cur.fetchone()
 
 
-def create_application(cur, mobile, cleaned):
+def create_application(cur, mobile, cleaned, note=""):
     """Insert a validated application; ensure the status-portal account exists.
 
     The caller commits. Returns (id, application_no).
@@ -210,8 +228,39 @@ def create_application(cur, mobile, cleaned):
     if cur.fetchone()[0] == 0:
         cur.execute("INSERT INTO portal_users (mobile, password_hash) VALUES (%s,%s)",
                     (mobile, hash_password(portal_pass)))
-    write_audit(cur, new_id, "SUBMIT", "applicant:%s" % mobile)
+    write_audit(cur, new_id, "SUBMIT", "applicant:%s" % mobile, note)
     return new_id, app_no
+
+
+# ---------------------------------------------------------------------------
+# Age-proof documents: one implementation for the web form, the assistant and
+# the upload link, so every channel stores files the same way.
+# ---------------------------------------------------------------------------
+
+ALLOWED_DOC_TYPES = {"pdf": b"%PDF", "png": b"\x89PNG", "jpg": b"\xff\xd8", "jpeg": b"\xff\xd8"}
+MAX_DOC_BYTES = 5 * 1024 * 1024
+
+
+def save_age_proof(mobile, filename, content):
+    """Validate and store an age-proof file. Returns (path, error)."""
+    from werkzeug.utils import secure_filename
+    raw = (filename or "").strip().lower()
+    ext = raw.rsplit(".", 1)[-1] if "." in raw else ""
+    stem = secure_filename(raw.rsplit(".", 1)[0]) or "document"   # Assamese names -> "document"
+    name = "%s.%s" % (stem[:60], ext)
+    if ext not in ALLOWED_DOC_TYPES:
+        return None, "Please upload a JPG, PNG or PDF file."
+    if not content:
+        return None, "The file is empty."
+    if len(content) > MAX_DOC_BYTES:
+        return None, "File is larger than 5 MB. Please upload a smaller file."
+    if not content.startswith(ALLOWED_DOC_TYPES[ext]):
+        return None, "The file does not look like a real %s. Please send a photo or scan." % ext.upper()
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    path = os.path.join(UPLOAD_DIR, "%s_%s_%s" % (mobile, datetime.now().strftime("%Y%m%d%H%M%S"), name))
+    with open(path, "wb") as out:
+        out.write(content)
+    return path, None
 
 
 # ---------------------------------------------------------------------------
@@ -339,18 +388,10 @@ def upload():
         if f is None or f.filename == "":
             flash("Please choose a file to upload (JPG, PNG or PDF, up to 5 MB).")
             return render_template("upload.html")
-        filename = f.filename.lower()
-        content = f.read()
-        if not filename.rsplit(".", 1)[-1] in ("pdf", "jpg", "jpeg", "png"):
-            flash("Please upload a JPG, PNG or PDF file.")
+        path, err = save_age_proof(session["verified_mobile"], f.filename, f.read())
+        if err:
+            flash(err)
             return render_template("upload.html")
-        if len(content) > 5 * 1024 * 1024:
-            flash("File is larger than 5 MB. Please upload a smaller file.")
-            return render_template("upload.html")
-        os.makedirs(UPLOAD_DIR, exist_ok=True)
-        path = os.path.join(UPLOAD_DIR, "%s_%s" % (session["verified_mobile"], filename))
-        with open(path, "wb") as out:
-            out.write(content)
         session["doc_path"] = path
         return redirect(url_for("declaration"))
     return render_template("upload.html")
@@ -380,6 +421,7 @@ def handle_submission():
 
     conn = get_db()
     cur = conn.cursor()
+    lock_mobile(cur, mobile)
     existing = active_application(cur, mobile)
     if existing:
         cur.close(); conn.close()
@@ -600,7 +642,10 @@ def admin_list():
         return redirect(url_for("admin_login"))
     status = request.args.get("status", "PENDING")
     mobile = request.args.get("mobile", "").strip()
-    page = int(request.args.get("page", 1))
+    try:
+        page = max(1, int(request.args.get("page", 1)))
+    except ValueError:
+        page = 1
     conn = get_db()
     cur = conn.cursor()
     if mobile:
@@ -672,6 +717,8 @@ def admin_reject(app_id):
 
 from oauth import oauth as _oauth_blueprint   # noqa: E402  (needs the definitions above)
 app.register_blueprint(_oauth_blueprint)
+from api import api as _api_blueprint          # noqa: E402  (internal API behind the MCP servers)
+app.register_blueprint(_api_blueprint)
 
 
 if __name__ == "__main__":

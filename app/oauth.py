@@ -325,7 +325,10 @@ def authorize():
         return _err_redirect(redirect_uri, state, "unsupported_response_type", "only code is supported")
     if q.get("code_challenge_method", "S256") != "S256" or not q.get("code_challenge"):
         return _err_redirect(redirect_uri, state, "invalid_request", "PKCE with S256 is required")
-    scopes = [s for s in (q.get("scope") or "citizen").split() if s]
+    # Some MCP clients add OIDC-style scopes (offline_access, openid) by habit; refresh
+    # tokens are always issued here, so drop them rather than fail the sign-in.
+    scopes = [s for s in (q.get("scope") or "citizen").split()
+              if s and s not in ("offline_access", "openid", "profile")] or ["citizen"]
     unknown = [s for s in scopes if s not in SCOPES]
     if unknown or len(scopes) != 1:
         return _err_redirect(redirect_uri, state, "invalid_scope",
@@ -591,7 +594,15 @@ def admin_tokens():
     if not session.get("admin"):
         return redirect(url_for("admin_login"))
     issued = None
-    if request.method == "POST" and not request.form.get("revoke_subject"):
+    if request.method == "POST" and request.form.get("revoke_jti"):
+        conn = portal.get_db()
+        cur = conn.cursor()
+        cur.execute("UPDATE oauth_program_tokens SET revoked_at = %s WHERE jti = %s AND revoked_at IS NULL",
+                    (datetime.now(), request.form["revoke_jti"]))
+        flash("%d program token(s) revoked." % cur.rowcount)
+        conn.commit()
+        cur.close(); conn.close()
+    if request.method == "POST" and not request.form.get("revoke_subject") and not request.form.get("revoke_jti"):
         label = (request.form.get("label") or "program").strip()[:100]
         audience = (request.form.get("audience") or "").strip() or ISSUER
         days = max(1, min(int(request.form.get("days") or 90), 365))
@@ -611,7 +622,7 @@ def admin_tokens():
         flash("%d officer sign-in(s) ended." % n)
     conn = portal.get_db()
     cur = conn.cursor()
-    cur.execute("SELECT label, subject, audience, issued_by, created_at, expires_at FROM "
+    cur.execute("SELECT label, subject, audience, issued_by, created_at, expires_at, jti, revoked_at FROM "
                 "oauth_program_tokens ORDER BY id DESC LIMIT 20")
     rows = cur.fetchall()
     cur.execute("SELECT client_name, kind, created_at FROM oauth_clients ORDER BY id DESC LIMIT 20")
