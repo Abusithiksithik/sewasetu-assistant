@@ -1,3 +1,24 @@
+# Sewa Setu assistant
+
+The Old Age Pension portal of Purvanchal, opened to AI assistants: a citizen MCP server and a
+block-officer MCP server, signed in through the portal's own OAuth, with the portal as the
+system of record. Read in this order:
+
+- `DESIGN-NOTE.md`: the three decisions that mattered most
+- `FINDINGS.md`: what the code and the 100k-row snapshot showed, and what was fixed
+- `DEPLOY.md`: running it on a VM with HTTPS, connecting Claude Code, running the evals
+- `assistant/`: the MCP servers (`server.py`), token checks (`auth.py`), `/eval-dashboard`
+- `assistant/evals/`: personas, the harness, the scripted smoke test, the changelog
+- `app/api.py`: the internal API behind the MCP servers (not public)
+
+| Endpoint | For |
+|---|---|
+| `https://<domain>/mcp/citizen` | applicants (scope `citizen`) |
+| `https://<domain>/mcp/officer` | block officers (scope `officer`) |
+| `https://<domain>/eval-dashboard` | personas, conversations, checks |
+
+---
+
 # Sewa Setu — Old Age Pension Portal
 
 Department of Social Welfare, Government of Purvanchal. Maintained in-house.
